@@ -1,0 +1,158 @@
+
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <lame/lame.h>
+
+#define MAX_FILES 1000000
+
+// Structure to hold the data for each file fragment
+typedef struct {
+    char* data;
+    int size;
+} FileFragment;
+
+// Global array to hold the file fragments
+FileFragment fragments[MAX_FILES];
+
+// Mutex to protect the shared data structure
+pthread_mutex_t mutex;
+
+// Thread function to traverse a directory and concatenate the files
+void* concatenate_files(void* path) {
+    DIR* dir = opendir((char*)path);
+
+    if (dir == NULL) {
+        fprintf(stderr, "Error opening directory: %s\n", (char*)path);
+        return NULL;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char* subpath = malloc(strlen((char*)path) + strlen(entry->d_name) + 2);
+        sprintf(subpath, "%s/%s", (char*)path, entry->d_name);
+
+        struct stat sb;
+        if (stat(subpath, &sb) == -1) {
+            fprintf(stderr, "Error statting file: %s\n", subpath);
+            continue;
+        }
+
+        // Only process regular files with the .bin extension
+        if (S_ISREG(sb.st_mode)) {
+            char* ext = strrchr(entry->d_name, '.');
+            if (ext != NULL && strcmp(ext, ".bin") == 0) {
+                // Found a .bin file, extract the number from the
+                int num = atoi(entry->d_name);
+
+                // Open the file and read the data
+                FILE* fp = fopen(subpath, "rb");
+                if (fp == NULL) {
+                    fprintf(stderr, "Error opening file: %s\n", subpath);
+                    continue;
+                }
+
+                fseek(fp, 0, SEEK_END);
+                int size = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+
+                char* data = malloc(size);
+                fread(data, 1, size, fp);
+                fclose(fp);
+
+                // Store the data in the global array
+                pthread_mutex_lock(&mutex);
+                fragments[num].data = data;
+                fragments[num].size = size;
+                pthread_mutex_unlock(&mutex);
+            }
+        }
+        free(subpath);
+    }
+    closedir(dir);
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    // Check for the correct number of arguments
+    if (argc != 3) {
+        fprintf(stderr, "Usage: defrag <directory> <output file>\n");
+        return 1;
+    }
+
+    // Initialize the mutex
+    if (pthread_mutex_init(&mutex, NULL) != 0) {
+        fprintf(stderr, "Error initializing mutex\n");
+        return 1;
+    }
+    
+    // Initialize the LAME MP3 encoder
+	lame_t lame = lame_init();
+lame_set_in_samplerate(lame, 44100);
+lame_set_VBR(lame, vbr_default);
+lame_init_params(lame);
+    	
+    // Start up a thread to process the top level directory
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, concatenate_files, argv[1]) != 0) {
+        fprintf(stderr, "Error creating thread\n");
+        return 1;
+    }
+    pthread_join(thread, NULL);
+    
+    // Open the output file
+FILE* output = fopen(argv[2], "wb");
+if (output == NULL) {
+    fprintf(stderr, "Error opening output file: %s\n", argv[2]);
+    return 1;
+}
+    
+    // Determine the total size of the concatenated data
+int total_size = 0;
+for (int i = 0; i < MAX_FILES; i++) {
+    total_size += fragments[i].size;
+}
+
+// Allocate a buffer to hold the concatenated data
+char* buffer = malloc(total_size);
+
+// Concatenate the data
+int offset = 0;
+for (int i = 0; i < MAX_FILES; i++) {
+    memcpy(buffer + offset, fragments[i].data, fragments[i].size);
+    offset += fragments[i].size;
+}
+
+// Convert the data to MP3 and write it to the output file
+int num_channels = 2;
+int num_samples = total_size / sizeof(short) / num_channels;
+
+int mp3_size = lame_encode_buffer_interleaved(lame, (short*)buffer, num_samples, (unsigned char*)mp3_buffer, BUFFER_SIZE);
+fwrite(mp3_buffer, 1, mp3_size, output);
+
+// Flush the remaining data
+int remaining = lame_encode_flush(lame, (unsigned char*)mp3_buffer, BUFFER_SIZE);
+fwrite(mp3_buffer, 1, remaining, output);
+
+// Close the output file
+fclose(output);
+
+// Clean up the LAME encoder
+lame_close(lame);
+
+    // Clean up resources
+    pthread_mutex_destroy(&mutex);
+
+    return 0;
+}
+
